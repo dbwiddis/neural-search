@@ -10,10 +10,14 @@ import org.apache.lucene.document.TextField;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.Term;
 import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.LeafCollector;
 import org.apache.lucene.search.Scorable;
+import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.Scorer;
+import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.search.Weight;
 import org.apache.lucene.store.Directory;
 import org.opensearch.neuralsearch.query.HybridQueryScorer;
@@ -21,6 +25,7 @@ import org.opensearch.neuralsearch.query.HybridSubQueryScorer;
 import org.opensearch.search.profile.ProfilingWrapper;
 import org.opensearch.neuralsearch.search.HitsThresholdChecker;
 
+import java.io.IOException;
 import java.util.Arrays;
 import java.util.Collections;
 
@@ -32,6 +37,16 @@ public class HybridLeafCollectorTests extends HybridCollectorTestCase {
     static final String TEXT_FIELD_NAME = "field";
     private static final int NUM_DOCS = 4;
     private static final int TOTAL_HITS_UP_TO = 1000;
+
+    /**
+     * Build a real Scorer for a single term. Profiler-mode score attribution can only be tested with real
+     * sub-scorers: HybridQueryScorer reports scores for the sub-queries that its approximation says are
+     * positioned on the current doc, so a mocked sub-scorer contributes nothing regardless of its docID().
+     */
+    private Scorer termScorer(IndexSearcher searcher, LeafReaderContext context, String term) throws IOException {
+        Weight weight = searcher.createWeight(searcher.rewrite(new TermQuery(new Term(TEXT_FIELD_NAME, term))), ScoreMode.TOP_SCORES, 1.0f);
+        return weight.scorerSupplier(context).get(Long.MAX_VALUE);
+    }
 
     @SneakyThrows
     public void testSetScorer_whenHybridQueryScorerPassedDirectly_thenProfilerModeActivated() {
@@ -78,42 +93,39 @@ public class HybridLeafCollectorTests extends HybridCollectorTestCase {
         final IndexWriter w = new IndexWriter(directory, newIndexWriterConfig());
         FieldType ft = new FieldType(TextField.TYPE_NOT_STORED);
         ft.freeze();
-        w.addDocument(getDocument(TEXT_FIELD_NAME, 1, "text1", ft));
+        w.addDocument(getDocument(TEXT_FIELD_NAME, 1, "text1 alpha", ft));
         w.commit();
 
         DirectoryReader reader = DirectoryReader.open(w);
         LeafReaderContext leafReaderContext = reader.getContext().leaves().get(0);
+        IndexSearcher searcher = new IndexSearcher(reader);
 
         HybridTopScoreDocCollector collector = new HybridTopScoreDocCollector(NUM_DOCS, new HitsThresholdChecker(TOTAL_HITS_UP_TO));
         LeafCollector leafCollector = collector.getLeafCollector(leafReaderContext);
 
-        // Create mock scorers positioned on doc 5
-        Scorer subScorer1 = mock(Scorer.class);
-        Scorer subScorer2 = mock(Scorer.class);
-        when(subScorer1.docID()).thenReturn(5);
-        when(subScorer2.docID()).thenReturn(5);
-        when(subScorer1.score()).thenReturn(1.5f);
-        when(subScorer2.score()).thenReturn(2.5f);
+        // Both sub-queries match doc 0
+        Scorer subScorer1 = termScorer(searcher, leafReaderContext, "text1");
+        Scorer subScorer2 = termScorer(searcher, leafReaderContext, "alpha");
 
-        // Mock HybridQueryScorer to control docID and sub-scorers
-        HybridQueryScorer mockHybridScorer = mock(HybridQueryScorer.class);
-        when(mockHybridScorer.docID()).thenReturn(5);
-        when(mockHybridScorer.getSubScorers()).thenReturn(Arrays.asList(subScorer1, subScorer2));
+        HybridQueryScorer hybridQueryScorer = new HybridQueryScorer(Arrays.asList(subScorer1, subScorer2));
+        assertEquals("hybrid scorer should be positioned on doc 0", 0, hybridQueryScorer.iterator().nextDoc());
 
         HybridTopScoreDocCollector.HybridTopScoreLeafCollector hybridLeafCollector =
             (HybridTopScoreDocCollector.HybridTopScoreLeafCollector) leafCollector;
 
         // Directly set the profiler-mode fields
-        hybridLeafCollector.hybridQueryScorer = mockHybridScorer;
+        hybridLeafCollector.hybridQueryScorer = hybridQueryScorer;
         hybridLeafCollector.compoundQueryScorer = new HybridSubQueryScorer(2);
 
         // Populate scores
         hybridLeafCollector.populateScoresFromHybridQueryScorer();
 
-        // Verify scores were populated
+        // Verify scores were populated for both matching sub-queries
         float[] scores = hybridLeafCollector.getCompoundQueryScorer().getSubQueryScores();
-        assertEquals("sub-query 1 score should be 1.5", 1.5f, scores[0], 0.001f);
-        assertEquals("sub-query 2 score should be 2.5", 2.5f, scores[1], 0.001f);
+        assertEquals("sub-query 1 score should match its sub-scorer", subScorer1.score(), scores[0], 0.001f);
+        assertEquals("sub-query 2 score should match its sub-scorer", subScorer2.score(), scores[1], 0.001f);
+        assertTrue("sub-query 1 score should be positive", scores[0] > 0.0f);
+        assertTrue("sub-query 2 score should be positive", scores[1] > 0.0f);
 
         reader.close();
         w.close();
@@ -127,36 +139,33 @@ public class HybridLeafCollectorTests extends HybridCollectorTestCase {
         FieldType ft = new FieldType(TextField.TYPE_NOT_STORED);
         ft.freeze();
         w.addDocument(getDocument(TEXT_FIELD_NAME, 1, "text1", ft));
+        w.addDocument(getDocument(TEXT_FIELD_NAME, 2, "alpha", ft));
         w.commit();
 
         DirectoryReader reader = DirectoryReader.open(w);
         LeafReaderContext leafReaderContext = reader.getContext().leaves().get(0);
+        IndexSearcher searcher = new IndexSearcher(reader);
 
         HybridTopScoreDocCollector collector = new HybridTopScoreDocCollector(NUM_DOCS, new HitsThresholdChecker(TOTAL_HITS_UP_TO));
         LeafCollector leafCollector = collector.getLeafCollector(leafReaderContext);
 
-        // subScorer1 on doc 5, subScorer2 on doc 10
-        Scorer subScorer1 = mock(Scorer.class);
-        Scorer subScorer2 = mock(Scorer.class);
-        when(subScorer1.docID()).thenReturn(5);
-        when(subScorer2.docID()).thenReturn(10);
-        when(subScorer1.score()).thenReturn(1.5f);
-        when(subScorer2.score()).thenReturn(2.5f);
+        // subScorer1 matches doc 0 only, subScorer2 matches doc 1 only
+        Scorer subScorer1 = termScorer(searcher, leafReaderContext, "text1");
+        Scorer subScorer2 = termScorer(searcher, leafReaderContext, "alpha");
 
-        HybridQueryScorer mockHybridScorer = mock(HybridQueryScorer.class);
-        when(mockHybridScorer.docID()).thenReturn(5);
-        when(mockHybridScorer.getSubScorers()).thenReturn(Arrays.asList(subScorer1, subScorer2));
+        HybridQueryScorer hybridQueryScorer = new HybridQueryScorer(Arrays.asList(subScorer1, subScorer2));
+        assertEquals("hybrid scorer should be positioned on doc 0", 0, hybridQueryScorer.iterator().nextDoc());
 
         HybridTopScoreDocCollector.HybridTopScoreLeafCollector hybridLeafCollector =
             (HybridTopScoreDocCollector.HybridTopScoreLeafCollector) leafCollector;
 
-        hybridLeafCollector.hybridQueryScorer = mockHybridScorer;
+        hybridLeafCollector.hybridQueryScorer = hybridQueryScorer;
         hybridLeafCollector.compoundQueryScorer = new HybridSubQueryScorer(2);
 
         hybridLeafCollector.populateScoresFromHybridQueryScorer();
 
         float[] scores = hybridLeafCollector.getCompoundQueryScorer().getSubQueryScores();
-        assertEquals("sub-query 1 score should be 1.5 (matching doc)", 1.5f, scores[0], 0.001f);
+        assertTrue("sub-query 1 score should be positive (matching doc)", scores[0] > 0.0f);
         assertEquals("sub-query 2 score should be 0.0 (different doc)", 0.0f, scores[1], 0.001f);
 
         reader.close();
@@ -218,24 +227,22 @@ public class HybridLeafCollectorTests extends HybridCollectorTestCase {
         HybridTopScoreDocCollector collector = new HybridTopScoreDocCollector(NUM_DOCS, new HitsThresholdChecker(TOTAL_HITS_UP_TO));
         LeafCollector leafCollector = collector.getLeafCollector(leafReaderContext);
 
-        Scorer subScorer1 = mock(Scorer.class);
-        when(subScorer1.docID()).thenReturn(5);
-        when(subScorer1.score()).thenReturn(1.5f);
+        IndexSearcher searcher = new IndexSearcher(reader);
+        Scorer subScorer1 = termScorer(searcher, leafReaderContext, "text1");
 
-        HybridQueryScorer mockHybridScorer = mock(HybridQueryScorer.class);
-        when(mockHybridScorer.docID()).thenReturn(5);
-        when(mockHybridScorer.getSubScorers()).thenReturn(Arrays.asList(subScorer1, null));
+        HybridQueryScorer hybridQueryScorer = new HybridQueryScorer(Arrays.asList(subScorer1, null));
+        assertEquals("hybrid scorer should be positioned on doc 0", 0, hybridQueryScorer.iterator().nextDoc());
 
         HybridTopScoreDocCollector.HybridTopScoreLeafCollector hybridLeafCollector =
             (HybridTopScoreDocCollector.HybridTopScoreLeafCollector) leafCollector;
 
-        hybridLeafCollector.hybridQueryScorer = mockHybridScorer;
+        hybridLeafCollector.hybridQueryScorer = hybridQueryScorer;
         hybridLeafCollector.compoundQueryScorer = new HybridSubQueryScorer(2);
 
         hybridLeafCollector.populateScoresFromHybridQueryScorer();
 
         float[] scores = hybridLeafCollector.getCompoundQueryScorer().getSubQueryScores();
-        assertEquals("sub-query 1 score should be 1.5", 1.5f, scores[0], 0.001f);
+        assertTrue("sub-query 1 score should be positive", scores[0] > 0.0f);
         assertEquals("sub-query 2 score should be 0.0 (null scorer)", 0.0f, scores[1], 0.001f);
 
         reader.close();
@@ -363,28 +370,26 @@ public class HybridLeafCollectorTests extends HybridCollectorTestCase {
         HybridTopScoreDocCollector collector = new HybridTopScoreDocCollector(NUM_DOCS, new HitsThresholdChecker(TOTAL_HITS_UP_TO));
         LeafCollector leafCollector = collector.getLeafCollector(leafReaderContext);
 
-        // Create mock scorers positioned on doc 0
-        Scorer subScorer1 = mock(Scorer.class);
-        when(subScorer1.docID()).thenReturn(0);
-        when(subScorer1.score()).thenReturn(2.0f);
-        when(subScorer1.iterator()).thenReturn(DocIdSetIterator.empty());
+        // Real sub-scorer positioned on doc 0
+        IndexSearcher searcher = new IndexSearcher(reader);
+        Scorer subScorer1 = termScorer(searcher, leafReaderContext, "text1");
 
-        HybridQueryScorer mockHybridScorer = mock(HybridQueryScorer.class);
-        when(mockHybridScorer.docID()).thenReturn(0);
-        when(mockHybridScorer.getSubScorers()).thenReturn(Arrays.asList(subScorer1));
+        HybridQueryScorer hybridQueryScorer = new HybridQueryScorer(Arrays.asList(subScorer1));
+        assertEquals("hybrid scorer should be positioned on doc 0", 0, hybridQueryScorer.iterator().nextDoc());
+
+        // Going through setScorer() takes the profiler path and initializes the collector's score thresholds
+        leafCollector.setScorer(hybridQueryScorer);
 
         HybridTopScoreDocCollector.HybridTopScoreLeafCollector hybridLeafCollector =
             (HybridTopScoreDocCollector.HybridTopScoreLeafCollector) leafCollector;
-
-        // Set profiler-mode fields
-        hybridLeafCollector.hybridQueryScorer = mockHybridScorer;
-        hybridLeafCollector.compoundQueryScorer = new HybridSubQueryScorer(1);
+        assertNotNull("profiler mode should be active", hybridLeafCollector.getHybridQueryScorer());
 
         // Call collect() which should internally call populateScoresFromHybridQueryScorer()
         leafCollector.collect(0);
 
         // Verify that scores were collected (totalHits incremented)
         assertTrue("totalHits should be > 0 after collect", collector.getTotalHits() > 0);
+        assertTrue("collected score should be positive", hybridLeafCollector.getCompoundQueryScorer().getSubQueryScores()[0] > 0.0f);
 
         reader.close();
         w.close();

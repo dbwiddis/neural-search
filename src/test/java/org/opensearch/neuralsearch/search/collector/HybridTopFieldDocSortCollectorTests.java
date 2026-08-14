@@ -267,9 +267,7 @@ public class HybridTopFieldDocSortCollectorTests extends HybridCollectorTestCase
         // execute: collect docs — populateScoresFromHybridQueryScorer() populates scores from mock
         for (int doc = 0; doc < NUM_DOCS; doc++) {
             float score = 1.0f + doc * 0.1f;
-            when(mockHybridScorer.docID()).thenReturn(doc);
-            when(subScorer1.docID()).thenReturn(doc);
-            when(subScorer1.score()).thenReturn(score);
+            stubHybridScores(mockHybridScorer, score);
             leafCollector.collect(doc);
         }
 
@@ -331,9 +329,7 @@ public class HybridTopFieldDocSortCollectorTests extends HybridCollectorTestCase
         // execute: collect docs starting after doc 0
         for (int doc = 1; doc < NUM_DOCS; doc++) {
             float score = 1.0f + doc * 0.1f;
-            when(mockHybridScorer.docID()).thenReturn(doc);
-            when(subScorer1.docID()).thenReturn(doc);
-            when(subScorer1.score()).thenReturn(score);
+            stubHybridScores(mockHybridScorer, score);
             leafCollector.collect(doc);
         }
 

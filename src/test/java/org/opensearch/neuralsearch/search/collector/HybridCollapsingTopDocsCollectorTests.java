@@ -1200,9 +1200,7 @@ public class HybridCollapsingTopDocsCollectorTests extends HybridCollectorTestCa
         // execute: collect docs
         for (int doc = 0; doc < 20; doc++) {
             float score = 1.0f + doc * 0.05f;
-            when(mockHybridScorer.docID()).thenReturn(doc);
-            when(subScorer1.docID()).thenReturn(doc);
-            when(subScorer1.score()).thenReturn(score);
+            stubHybridScores(mockHybridScorer, score);
             leafCollector.collect(doc);
         }
 

@@ -1315,6 +1315,90 @@ public class HybridQueryIT extends BaseNeuralSearchIT {
     }
 
     /**
+     * Regression test for https://github.com/opensearch-project/neural-search/issues/1946
+     * A sub-query with a partial minimum_should_match rewrites to a WANDScorer, whose two-phase iterator is
+     * stateful. With profile: true the request runs through HybridQueryScorer instead of HybridBulkScorer, so
+     * a stale sub-query position made HybridQueryScorer verify the wrong doc and WANDScorer popped an empty
+     * queue, failing the whole request with ArrayIndexOutOfBoundsException. Comparing against profile: false
+     * also guards score attribution, which was silently wrong on the profile path even when it did not throw.
+     */
+    @SneakyThrows
+    public void testProfile_whenSubQueryHasPartialMinimumShouldMatch_thenMatchesNonProfiledResults() {
+        initializeIndexIfNotExist(TEST_INDEX_WITH_KEYWORDS_ONE_SHARD);
+        createSearchPipelineWithResultsPostProcessor(SEARCH_PIPELINE);
+
+        // Both sub-queries have to have a scorer in the same segment, otherwise the hybrid scorer holds a single
+        // sub-iterator and the stale priority queue is trivially correct. Documents are indexed one per segment, so
+        // the segments have to be merged first.
+        Response forceMergeResponse = client().performRequest(
+            new Request("POST", "/" + TEST_INDEX_WITH_KEYWORDS_ONE_SHARD + "/_forcemerge?max_num_segments=1")
+        );
+        assertEquals(RestStatus.OK, RestStatus.fromCode(forceMergeResponse.getStatusLine().getStatusCode()));
+        client().performRequest(new Request("POST", "/" + TEST_INDEX_WITH_KEYWORDS_ONE_SHARD + "/_refresh"));
+
+        // A single shard with several documents is required. The minimum_should_match sub-query matches only the
+        // last document (price 350, keyword "entire"), while the second sub-query matches four documents that all
+        // precede it. Both parts matter: the minimum_should_match sub-query has to sit on a later doc than the one
+        // the hybrid query is on, and the hybrid query has to stay on earlier docs for more than one doc, so that
+        // the stateful two-phase iterator of the minimum_should_match sub-query is asked to verify more than once
+        // from the same position. With one document per shard neither condition can arise.
+        String baseQuery = "{\n"
+            + "  \"query\": {\n"
+            + "    \"hybrid\": {\n"
+            + "      \"queries\": [\n"
+            + "        { \"bool\": {\n"
+            + "            \"minimum_should_match\": 3,\n"
+            + "            \"should\": [\n"
+            + "              { \"term\": { \""
+            + KEYWORD_FIELD_1
+            + "\": \""
+            + KEYWORD_FIELD_4_VALUE
+            + "\" } },\n"
+            + "              { \"range\": { \""
+            + INTEGER_FIELD_PRICE
+            + "\": { \"gte\": 300 } } },\n"
+            + "              { \"range\": { \""
+            + INTEGER_FIELD_PRICE
+            + "\": { \"gte\": 340 } } },\n"
+            + "              { \"range\": { \""
+            + INTEGER_FIELD_PRICE
+            + "\": { \"gte\": 200 } } }\n"
+            + "            ]\n"
+            + "        } },\n"
+            + "        { \"range\": { \""
+            + INTEGER_FIELD_PRICE
+            + "\": { \"lte\": 130 } } }\n"
+            + "      ]\n"
+            + "    }\n"
+            + "  }";
+        String plainQuery = baseQuery + "\n}";
+        String profiledQuery = baseQuery + ",\n  \"profile\": true\n}";
+
+        Map<String, Object> plainResponse = searchWithRawQuery(TEST_INDEX_WITH_KEYWORDS_ONE_SHARD, plainQuery, 10, SEARCH_PIPELINE);
+        // Before the fix this request failed outright with ArrayIndexOutOfBoundsException
+        Map<String, Object> profiledResponse = searchWithRawQuery(TEST_INDEX_WITH_KEYWORDS_ONE_SHARD, profiledQuery, 10, SEARCH_PIPELINE);
+
+        assertNotNull("profile data must be present", profiledResponse.get("profile"));
+        assertTrue("expected at least one hit", getHitCount(plainResponse) >= 1);
+
+        List<Map<String, Object>> plainHits = getNestedHits(plainResponse);
+        List<Map<String, Object>> profiledHits = getNestedHits(profiledResponse);
+        assertEquals("profile: true must return the same number of hits as profile: false", plainHits.size(), profiledHits.size());
+        for (int i = 0; i < plainHits.size(); i++) {
+            assertEquals(
+                "doc id at rank " + i + " must match across profiled and non-profiled paths",
+                plainHits.get(i).get("_id"),
+                profiledHits.get(i).get("_id")
+            );
+            double plainScore = ((Number) plainHits.get(i).get("_score")).doubleValue();
+            double profiledScore = ((Number) profiledHits.get(i).get("_score")).doubleValue();
+            assertTrue("non-profiled score must be positive", plainScore > 0);
+            assertTrue("profiled score must be positive", profiledScore > 0);
+            assertEquals("score at rank " + i + " must match across profiled and non-profiled paths", plainScore, profiledScore, 0.002);
+        }
+    }
+
+    /**
      * Tests that hybrid query with multiple shards works with profiler enabled.
      * This tests the distributed profiling scenario.
      */

@@ -7,7 +7,6 @@ package org.opensearch.neuralsearch.query;
 import com.google.common.annotations.VisibleForTesting;
 import lombok.Getter;
 import lombok.extern.log4j.Log4j2;
-import org.apache.lucene.search.DisiPriorityQueue;
 import org.apache.lucene.search.DisiWrapper;
 import org.apache.lucene.search.DisjunctionDISIApproximation;
 import org.apache.lucene.search.DocIdSetIterator;
@@ -36,9 +35,7 @@ public class HybridQueryScorer extends Scorer {
     @Getter
     private final List<Scorer> subScorers;
 
-    private final DisiPriorityQueue subScorersPQ;
-
-    private final DocIdSetIterator approximation;
+    private final HybridSubqueriesDISIApproximation approximation;
     private final HybridScoreBlockBoundaryPropagator disjunctionBlockPropagator;
     private final TwoPhase twoPhase;
     private final int numSubqueries;
@@ -55,11 +52,9 @@ public class HybridQueryScorer extends Scorer {
         if (hybridDisiWrappers.isEmpty()) {
             throw new IllegalArgumentException("There must be at least 1 subScorers");
         }
-        this.subScorersPQ = DisiPriorityQueue.ofMaxSize(numSubqueries);
-        this.subScorersPQ.addAll(hybridDisiWrappers.toArray(new DisiWrapper[0]), 0, hybridDisiWrappers.size());
         boolean needsScores = scoreMode != ScoreMode.COMPLETE_NO_SCORES;
 
-        this.approximation = new HybridSubqueriesDISIApproximation(hybridDisiWrappers, subScorersPQ);
+        this.approximation = new HybridSubqueriesDISIApproximation(hybridDisiWrappers);
 
         if (scoreMode == ScoreMode.TOP_SCORES) {
             this.disjunctionBlockPropagator = new HybridScoreBlockBoundaryPropagator(subScorers);
@@ -72,7 +67,7 @@ public class HybridQueryScorer extends Scorer {
         long sumApproxCost = 0;
         // Compute matchCost as the average over the matchCost of the subScorers.
         // This is weighted by the cost, which is an expected number of matching documents.
-        for (DisiWrapper w : subScorersPQ) {
+        for (DisiWrapper w : hybridDisiWrappers) {
             long costWeight = (w.cost <= 1) ? 1 : w.cost;
             sumApproxCost += costWeight;
             if (w.twoPhaseView != null) {
@@ -84,7 +79,7 @@ public class HybridQueryScorer extends Scorer {
             twoPhase = null;
         } else {
             final float matchCost = sumMatchCost / sumApproxCost;
-            twoPhase = new TwoPhase(approximation, matchCost, subScorersPQ, needsScores);
+            twoPhase = new TwoPhase(approximation, matchCost, hybridDisiWrappers.size(), needsScores);
         }
     }
 
@@ -119,9 +114,26 @@ public class HybridQueryScorer extends Scorer {
         return totalScore;
     }
 
+    /**
+     * Fill the provided array with the score of every sub-query that matches the doc this scorer is currently
+     * positioned on. Position in the array corresponds to the position of the sub-query in the hybrid query.
+     * Sub-queries that do not match the current doc are left untouched.
+     * @param scores array of scores per sub-query, must be at least as large as the number of sub-queries
+     * @throws IOException
+     */
+    public void hybridScores(final float[] scores) throws IOException {
+        for (DisiWrapper disiWrapper = getSubMatches(); disiWrapper != null; disiWrapper = disiWrapper.next) {
+            // check if this doc has match in the subQuery. If not, leave the score as is and continue
+            if (disiWrapper.scorer.docID() == DocIdSetIterator.NO_MORE_DOCS) {
+                continue;
+            }
+            scores[((HybridDisiWrapper) disiWrapper).getSubQueryIndex()] = disiWrapper.scorer.score();
+        }
+    }
+
     DisiWrapper getSubMatches() throws IOException {
         if (twoPhase == null) {
-            return subScorersPQ.topList();
+            return approximation.topList();
         } else {
             return twoPhase.getSubMatches();
         }
@@ -181,10 +193,7 @@ public class HybridQueryScorer extends Scorer {
      */
     @Override
     public int docID() {
-        if (subScorersPQ.size() == 0) {
-            return DocIdSetIterator.NO_MORE_DOCS;
-        }
-        return subScorersPQ.top().doc;
+        return approximation.docID();
     }
 
     private List<HybridDisiWrapper> initializeSubScorersList() {
@@ -225,14 +234,14 @@ public class HybridQueryScorer extends Scorer {
         DisiWrapper verifiedMatches;
         // priority queue of approximations on the current doc that have not been verified yet
         final PriorityQueue<DisiWrapper> unverifiedMatches;
-        DisiPriorityQueue subScorers;
+        HybridSubqueriesDISIApproximation subScorers;
         boolean needsScores;
 
-        private TwoPhase(DocIdSetIterator approximation, float matchCost, DisiPriorityQueue subScorers, boolean needsScores) {
-            super(approximation);
+        private TwoPhase(HybridSubqueriesDISIApproximation subScorers, float matchCost, int numSubScorers, boolean needsScores) {
+            super(subScorers);
             this.matchCost = matchCost;
             this.subScorers = subScorers;
-            unverifiedMatches = new PriorityQueue<>(subScorers.size()) {
+            unverifiedMatches = new PriorityQueue<>(numSubScorers) {
                 @Override
                 protected boolean lessThan(DisiWrapper a, DisiWrapper b) {
                     return a.matchCost < b.matchCost;
@@ -303,15 +312,20 @@ public class HybridQueryScorer extends Scorer {
      * sub iterators that return empty results
      */
     static class HybridSubqueriesDISIApproximation extends DocIdSetIterator {
-        final DocIdSetIterator docIdSetIterator;
-        final DisiPriorityQueue subIterators;
+        final DisjunctionDISIApproximation docIdSetIterator;
 
-        public HybridSubqueriesDISIApproximation(
-            final Collection<? extends DisiWrapper> subIterators,
-            final DisiPriorityQueue subIteratorsPQ
-        ) {
+        public HybridSubqueriesDISIApproximation(final Collection<? extends DisiWrapper> subIterators) {
             docIdSetIterator = new DisjunctionDISIApproximation(subIterators, 0);
-            this.subIterators = subIteratorsPQ;
+        }
+
+        /**
+         * Return the linked list of sub iterators that are positioned on the current doc. This must be the only
+         * source of sub-matches, the approximation owns the ordering of the sub iterators and it's the only
+         * component that knows which of them are on {@link #docID()}.
+         * @return head of the linked list of sub iterators on the current doc
+         */
+        DisiWrapper topList() {
+            return docIdSetIterator.topList();
         }
 
         @Override
@@ -321,25 +335,16 @@ public class HybridQueryScorer extends Scorer {
 
         @Override
         public int docID() {
-            if (subIterators.size() == 0) {
-                return NO_MORE_DOCS;
-            }
             return docIdSetIterator.docID();
         }
 
         @Override
         public int nextDoc() throws IOException {
-            if (subIterators.size() == 0) {
-                return NO_MORE_DOCS;
-            }
             return docIdSetIterator.nextDoc();
         }
 
         @Override
         public int advance(final int target) throws IOException {
-            if (subIterators.size() == 0) {
-                return NO_MORE_DOCS;
-            }
             return docIdSetIterator.advance(target);
         }
     }

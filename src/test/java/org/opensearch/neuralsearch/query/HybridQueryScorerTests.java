@@ -22,14 +22,28 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.commons.lang3.tuple.ImmutablePair;
 import org.apache.commons.lang3.tuple.Pair;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.document.Field;
+import org.apache.lucene.document.FieldType;
+import org.apache.lucene.document.TextField;
+import org.apache.lucene.index.DirectoryReader;
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.index.IndexWriter;
+import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.Term;
+import org.apache.lucene.search.BooleanClause;
+import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.DisiWrapper;
 import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.MatchNoDocsQuery;
 import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.Scorer;
+import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.search.TwoPhaseIterator;
 import org.apache.lucene.search.Weight;
+import org.apache.lucene.store.Directory;
 import org.apache.lucene.tests.util.TestUtil;
 
 import com.carrotsearch.randomizedtesting.RandomizedTest;
@@ -479,6 +493,92 @@ public class HybridQueryScorerTests extends OpenSearchQueryTestCase {
         float score = scorer.score();
 
         assertEquals(0.0f, score, 0.0f);
+    }
+
+    /**
+     * A sub-query with a partial minimum_should_match produces a WANDScorer, whose two-phase matches() is
+     * stateful: it may only be called on sub-iterators standing on the current doc, and only once per position.
+     * The scorer therefore has to take every position from its own approximation. When it kept a separate
+     * DisiPriorityQueue that was heapified once at construction (while all wrappers were still on doc -1) and
+     * never re-heapified, docID() and the sub-match list came from a frozen wrapper, WANDScorer.matches() got
+     * called twice for the same position, and it popped an empty queue.
+     * See <a href="https://github.com/opensearch-project/neural-search/issues/1946">issue 1946</a>.
+     */
+    @SneakyThrows
+    public void testSubMatches_whenSubQueryHasPartialMinimumShouldMatch_thenPositionsStayInSync() {
+        final String bodyField = "body";
+        final String titleField = "title";
+        final List<String> bodyTerms = List.of("alpha", "bravo", "charlie", "delta", "echo", "foxtrot");
+
+        Directory directory = newDirectory();
+        IndexWriter w = new IndexWriter(directory, newIndexWriterConfig());
+        FieldType ft = new FieldType(TextField.TYPE_NOT_STORED);
+        ft.freeze();
+        // docs 0..3 match only the title sub-query, docs 4..7 match only the minimum_should_match sub-query.
+        // Disjoint doc sets are what make a stale position observable.
+        for (int i = 0; i < 4; i++) {
+            Document doc = new Document();
+            doc.add(new Field(titleField, "needle", ft));
+            doc.add(new Field(bodyField, "zulu yankee", ft));
+            w.addDocument(doc);
+        }
+        for (int i = 0; i < 4; i++) {
+            Document doc = new Document();
+            doc.add(new Field(titleField, "haystack", ft));
+            doc.add(new Field(bodyField, String.join(" ", bodyTerms), ft));
+            w.addDocument(doc);
+        }
+        w.forceMerge(1);
+        w.commit();
+
+        IndexReader reader = DirectoryReader.open(w);
+        IndexSearcher searcher = new IndexSearcher(reader);
+        LeafReaderContext context = reader.leaves().get(0);
+
+        // sub-query 0: partial minimum_should_match over 6 clauses, which rewrites to a WANDScorer
+        BooleanQuery.Builder minimumShouldMatchQuery = new BooleanQuery.Builder().setMinimumNumberShouldMatch(4);
+        for (String term : bodyTerms) {
+            minimumShouldMatchQuery.add(new TermQuery(new Term(bodyField, term)), BooleanClause.Occur.SHOULD);
+        }
+        Weight minimumShouldMatchWeight = searcher.createWeight(
+            searcher.rewrite(minimumShouldMatchQuery.build()),
+            ScoreMode.TOP_SCORES,
+            1.0f
+        );
+        Scorer minimumShouldMatchScorer = minimumShouldMatchWeight.scorerSupplier(context).get(Long.MAX_VALUE);
+        assertNotNull("minimum_should_match sub-query must have a two-phase view", minimumShouldMatchScorer.twoPhaseIterator());
+
+        // sub-query 1: plain term query, no two-phase view
+        Weight termWeight = searcher.createWeight(
+            searcher.rewrite(new TermQuery(new Term(titleField, "needle"))),
+            ScoreMode.TOP_SCORES,
+            1.0f
+        );
+        Scorer termScorer = termWeight.scorerSupplier(context).get(Long.MAX_VALUE);
+
+        HybridQueryScorer hybridQueryScorer = new HybridQueryScorer(
+            Arrays.asList(minimumShouldMatchScorer, termScorer),
+            ScoreMode.TOP_SCORES
+        );
+
+        Set<Integer> matchedDocs = new HashSet<>();
+        DocIdSetIterator iterator = hybridQueryScorer.iterator();
+        for (int doc = iterator.nextDoc(); doc != NO_MORE_DOCS; doc = iterator.nextDoc()) {
+            matchedDocs.add(doc);
+            assertEquals("docID() must report the doc the iterator is on", doc, hybridQueryScorer.docID());
+            // every sub-match must stand on the current doc, otherwise a sub-query is credited for a doc it
+            // does not match and a stateful two-phase sub-scorer is asked to verify the wrong position
+            for (DisiWrapper wrapper = hybridQueryScorer.getSubMatches(); wrapper != null; wrapper = wrapper.next) {
+                assertEquals("sub-match must stand on the current doc", doc, wrapper.doc);
+                assertEquals("sub-scorer must stand on the current doc", doc, wrapper.scorer.docID());
+            }
+            assertTrue("score of a matching doc should be positive", hybridQueryScorer.score() > 0.0f);
+        }
+        assertEquals("every doc matches exactly one of the two sub-queries", Set.of(0, 1, 2, 3, 4, 5, 6, 7), matchedDocs);
+
+        reader.close();
+        w.close();
+        directory.close();
     }
 
     protected static Scorer scorerWithTwoPhaseIterator(final int[] docs, final float[] scores, Weight weight, int maxDoc) {

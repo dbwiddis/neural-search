@@ -13,6 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 * [Hybrid Query] Fix NoSuchElementException in hybrid query with sort/search_after when a shard returns no results ([#1939](https://github.com/opensearch-project/neural-search/pull/1939))
 * [SemanticHighlighter] Fix SemanticHighlighterExtBuilder.toXContent ([#1906](https://github.com/opensearch-project/neural-search/issues/1906)) (query-insights [#651](https://github.com/opensearch-project/query-insights/issues/651))
 * [Sparse ANN] Fold sparse vector tokens into the signed-short range (modulus 32768) so folded tokens are never sign-extended to a negative value when stored in short[] ([#1926](https://github.com/opensearch-project/neural-search/pull/1926))
+* [Hybrid Query] Read sub-query positions from the disjunction approximation instead of a priority queue that is never re-heapified, fixing ArrayIndexOutOfBoundsException and wrong sub-query scores for a profiled hybrid query whose sub-query has a partial minimum_should_match ([#1946](https://github.com/opensearch-project/neural-search/issues/1946))
 
 ### Infrastructure
 
